@@ -425,4 +425,13 @@ async def get_srt(job_id: str):
     return PlainTextResponse(job["srt"], media_type="text/plain",
         headers={"Content-Disposition":f'attachment; filename="subtitles.srt"'})
 
-app.mount("/", StaticFiles(directory=str(STATIC), html=True), name="static")
+from fastapi.responses import HTMLResponse
+
+@app.get("/")
+async def root():
+    index = STATIC / "index.html"
+    if index.exists():
+        return HTMLResponse(index.read_text(encoding="utf-8"))
+    return HTMLResponse("<h1>KatanaClips</h1>")
+
+app.mount("/static", StaticFiles(directory=str(STATIC)), name="static")
