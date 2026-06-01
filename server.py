@@ -234,45 +234,15 @@ async def render_clip(
 ) -> None:
     duration = end - start
 
-    # Step 1: simple cut first (no reencoding) to a temp file
-    tmp = dst.with_suffix('.tmp.mp4')
-    cut_cmd = [
+    # Single-pass: cut + encode, no filters at all
+    crf = {'h264_720':'23','h264_1080':'20','h264_4k':'18','h265_4k':'20','copy':'20'}.get(quality,'20')
+
+    cmd = [
         'ffmpeg', '-y',
         '-ss', str(start),
         '-t',  str(duration),
         '-i',  str(src),
-        '-c',  'copy',
-        '-avoid_negative_ts', 'make_zero',
-        str(tmp)
-    ]
-    proc = await asyncio.create_subprocess_exec(
-        *cut_cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-    _, stderr = await proc.communicate()
-    if proc.returncode != 0:
-        raise RuntimeError('Cut failed: ' + stderr.decode()[-400:])
-
-    # Step 2: re-encode with optional vertical + quality
-    crf = {'h264_720':'23','h264_1080':'20','h264_4k':'18','h265_4k':'20'}.get(quality,'20')
-
-    vf = []
-    if vertical:
-        vf.append('scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1')
-    else:
-        vf.append({'h264_720':'scale=1280:720','h264_1080':'scale=1920:1080',
-                   'h264_4k':'scale=3840:2160','h265_4k':'scale=3840:2160',
-                   'copy':'scale=1920:1080'}.get(quality,'scale=1920:1080'))
-
-    if quality == 'copy' and not vertical:
-        tmp.rename(dst)
-        return
-
-    vcodec = ['libx265','-tag:v','hvc1'] if quality.startswith('h265') else ['libx264','-profile:v','high']
-
-    enc_cmd = [
-        'ffmpeg', '-y',
-        '-i', str(tmp),
-        '-vf', ','.join(vf),
-        '-c:v', *vcodec,
+        '-c:v', 'libx264',
         '-crf', crf,
         '-preset', 'fast',
         '-pix_fmt', 'yuv420p',
@@ -281,12 +251,15 @@ async def render_clip(
         '-movflags', '+faststart',
         str(dst)
     ]
+
     proc = await asyncio.create_subprocess_exec(
-        *enc_cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
     _, stderr = await proc.communicate()
-    tmp.unlink(missing_ok=True)
     if proc.returncode != 0:
-        raise RuntimeError('Encode failed: ' + stderr.decode()[-800:])
+        raise RuntimeError(stderr.decode()[-800:])
 
 
 async def _run_export(job_id, src, clips, quality, vertical, style):
