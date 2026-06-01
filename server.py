@@ -237,16 +237,19 @@ async def render_clip(
 
     # 1. Vertical reframe 9:16
     if vertical:
-        # Safe crop: take center square crop then pad to 9:16
-        vf_parts.append("crop=ih*9/16:ih:(iw-ih*9/16)/2:0")
         scale_map = {
-            "h264_720":  "scale=720:1280:flags=lanczos",
-            "h264_1080": "scale=1080:1920:flags=lanczos",
-            "h264_4k":   "scale=2160:3840:flags=lanczos",
-            "h265_4k":   "scale=2160:3840:flags=lanczos",
-            "copy":      "scale=1080:1920:flags=lanczos",
+            "h264_720":  "scale=720:1280",
+            "h264_1080": "scale=1080:1920",
+            "h264_4k":   "scale=2160:3840",
+            "h265_4k":   "scale=2160:3840",
+            "copy":      "scale=1080:1920",
         }
-        vf_parts.append(scale_map.get(quality, "scale=1080:1920:flags=lanczos"))
+        target = scale_map.get(quality, "scale=1080:1920")
+        # crop center to 9:16, force even dimensions
+        vf_parts.append(
+            "crop=trunc(ih*9/16/2)*2:trunc(ih/2)*2:(iw-trunc(ih*9/16/2)*2)/2:0,"
+            + target + ":flags=lanczos,setsar=1"
+        )
     else:
         hscale = {
             "h264_720":  "scale=1280:720:flags=lanczos",
@@ -434,13 +437,5 @@ async def get_srt(job_id: str):
     from fastapi.responses import PlainTextResponse
     return PlainTextResponse(job["srt"], media_type="text/plain",
         headers={"Content-Disposition":f'attachment; filename="subtitles.srt"'})
-
-
-
-from fastapi.responses import HTMLResponse
-
-@app.get("/")
-async def root():
-    return HTMLResponse(open(STATIC / 'index.html').read() if (STATIC / 'index.html').exists() else '<h1>KatanaClips</h1>')
 
 
