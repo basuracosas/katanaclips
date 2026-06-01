@@ -275,6 +275,7 @@ async def render_clip(
         '-c:v', *vcodec,
         '-crf', crf,
         '-preset', 'fast',
+        '-pix_fmt', 'yuv420p',
         '-c:a', 'aac',
         '-b:a', '192k',
         '-movflags', '+faststart',
