@@ -233,162 +233,59 @@ async def render_clip(
     subtitle_style: dict,
 ) -> None:
     duration = end - start
-    vf_parts = []
 
-    # 1. Vertical reframe 9:16
-    if vertical:
-        scale_map = {
-            "h264_720":  "scale=720:1280",
-            "h264_1080": "scale=1080:1920",
-            "h264_4k":   "scale=2160:3840",
-            "h265_4k":   "scale=2160:3840",
-            "copy":      "scale=1080:1920",
-        }
-        target = scale_map.get(quality, "scale=1080:1920")
-        # crop center to 9:16, force even dimensions
-        vf_parts.append(
-            "crop=trunc(ih*9/16/2)*2:trunc(ih/2)*2:(iw-trunc(ih*9/16/2)*2)/2:0,"
-            + target + ":flags=lanczos,setsar=1"
-        )
-    else:
-        hscale = {
-            "h264_720":  "scale=1280:720:flags=lanczos",
-            "h264_1080": "scale=1920:1080:flags=lanczos",
-            "h264_4k":   "scale=3840:2160:flags=lanczos",
-            "h265_4k":   "scale=3840:2160:flags=lanczos",
-        }
-        if quality in hscale:
-            vf_parts.append(hscale[quality])
-
-    # 2. Subtitles - disabled for stability, will re-enable after testing
-    # if subtitle_segments:
-    #     try:
-    #         sub_filter = build_subtitle_filter(subtitle_segments, subtitle_style)
-    #         if sub_filter:
-    #             vf_parts.append(sub_filter)
-    #     except Exception:
-    #         pass
-
-    # Codec
-    crf_map = {"h264_720":"23","h264_1080":"20","h264_4k":"18","h265_4k":"20"}
-    crf = crf_map.get(quality, "20")
-
-    if quality == "copy" and not vertical and not subtitle_segments:
-        codec_args = ["-c","copy","-avoid_negative_ts","make_zero"]
-    elif quality.startswith("h265"):
-        codec_args = ["-c:v","libx265","-tag:v","hvc1","-crf",crf,"-preset","fast",
-                      "-c:a","aac","-b:a","192k","-movflags","+faststart"]
-    else:
-        codec_args = ["-c:v","libx264","-profile:v","high","-crf",crf,"-preset","fast",
-                      "-c:a","aac","-b:a","192k","-movflags","+faststart"]
-
-    cmd = ["ffmpeg","-y","-ss",str(start),"-t",str(duration),"-i",str(src)]
-    if vf_parts:
-        cmd += ["-vf", ",".join(vf_parts)]
-    cmd += codec_args + ["-avoid_negative_ts","make_zero", str(dst)]
-
+    # Step 1: simple cut first (no reencoding) to a temp file
+    tmp = dst.with_suffix('.tmp.mp4')
+    cut_cmd = [
+        'ffmpeg', '-y',
+        '-ss', str(start),
+        '-t',  str(duration),
+        '-i',  str(src),
+        '-c',  'copy',
+        '-avoid_negative_ts', 'make_zero',
+        str(tmp)
+    ]
     proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
+        *cut_cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
     _, stderr = await proc.communicate()
     if proc.returncode != 0:
-        raise RuntimeError(stderr.decode()[-600:])
+        raise RuntimeError('Cut failed: ' + stderr.decode()[-400:])
 
-# ─── API routes ───────────────────────────────────────────────────────────────
+    # Step 2: re-encode with optional vertical + quality
+    crf = {'h264_720':'23','h264_1080':'20','h264_4k':'18','h265_4k':'20'}.get(quality,'20')
 
-@app.post("/upload")
-async def upload_video(file: UploadFile = File(...)):
-    ext  = Path(file.filename or "video.mp4").suffix.lower() or ".mp4"
-    vid  = uuid.uuid4().hex
-    dest = UPLOADS / f"{vid}{ext}"
-    async with aiofiles.open(dest,"wb") as f:
-        while chunk := await file.read(2*1024*1024):
-            await f.write(chunk)
-    try:
-        meta = ffprobe_meta(dest)
-    except Exception as e:
-        dest.unlink(missing_ok=True)
-        raise HTTPException(400, str(e))
-    return {"video_id": vid, "filename": file.filename, "ext": ext, **meta}
+    vf = []
+    if vertical:
+        vf.append('scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1')
+    else:
+        vf.append({'h264_720':'scale=1280:720','h264_1080':'scale=1920:1080',
+                   'h264_4k':'scale=3840:2160','h265_4k':'scale=3840:2160',
+                   'copy':'scale=1920:1080'}.get(quality,'scale=1920:1080'))
 
+    if quality == 'copy' and not vertical:
+        tmp.rename(dst)
+        return
 
-@app.post("/analyze")
-async def analyze_video(
-    video_id:  str  = Form(...),
-    max_clips: int  = Form(5),
-    clip_len:  float= Form(60.0),
-    language:  str  = Form("es"),
-):
-    """Transcribe + detect viral moments. Returns segments + suggested clips."""
-    candidates = list(UPLOADS.glob(f"{video_id}.*"))
-    if not candidates: raise HTTPException(404,"Video not found")
-    src = candidates[0]
+    vcodec = ['libx265','-tag:v','hvc1'] if quality.startswith('h265') else ['libx264','-profile:v','high']
 
-    job_id = uuid.uuid4().hex
-    jobs[job_id] = {"status":"analyzing","step":"Extrayendo audio...","progress":5,
-                    "segments":[],"clips":[],"srt":""}
-    asyncio.create_task(_run_analysis(job_id, src, max_clips, clip_len, language))
-    return {"job_id": job_id}
-
-
-async def _run_analysis(job_id, src, max_clips, clip_len, language):
-    job = jobs[job_id]
-    try:
-        wav = UPLOADS / f"{src.stem}_mono.wav"
-
-        job["step"] = "Extrayendo audio..."; job["progress"] = 10
-        await asyncio.get_event_loop().run_in_executor(None, extract_audio, src, wav)
-
-        job["step"] = "Transcribiendo con Whisper..."; job["progress"] = 30
-        meta = await asyncio.get_event_loop().run_in_executor(None, ffprobe_meta, src)
-        duration = meta["duration"]
-
-        # Try whisper; graceful fallback if not installed
-        try:
-            segments = await asyncio.get_event_loop().run_in_executor(
-                None, transcribe_whisper, wav, language)
-        except Exception:
-            segments = []
-
-        job["step"] = "Detectando momentos virales..."; job["progress"] = 70
-        clips = await asyncio.get_event_loop().run_in_executor(
-            None, detect_viral_moments, wav, duration, max_clips, clip_len)
-
-        # Attach subtitle segments to each clip
-        for c in clips:
-            c["subtitle_segments"] = clip_segments_for(segments, c["start"], c["end"])
-
-        srt = segments_to_srt(segments)
-        job.update({"status":"done","progress":100,"step":"Análisis completo",
-                    "segments":segments,"clips":clips,"srt":srt,"duration":duration})
-        wav.unlink(missing_ok=True)
-    except Exception as e:
-        job.update({"status":"error","step":str(e),"progress":0})
-
-
-@app.post("/export")
-async def export_clips(
-    video_id:        str  = Form(...),
-    clips_json:      str  = Form(...),
-    quality:         str  = Form("h264_1080"),
-    vertical:        str  = Form("true"),
-    subtitle_style_json: str = Form("{}"),
-):
-    candidates = list(UPLOADS.glob(f"{video_id}.*"))
-    if not candidates: raise HTTPException(404,"Video not found")
-    src = candidates[0]
-
-    clips  = json.loads(clips_json)
-    style  = json.loads(subtitle_style_json)
-    vert   = vertical.lower() == "true"
-
-    job_id = uuid.uuid4().hex
-    jobs[job_id] = {"status":"exporting","total":len(clips),"done":0,
-                    "progress":0,"results":[],"errors":[]}
-    asyncio.create_task(_run_export(job_id, src, clips, quality, vert, style))
-    return {"job_id": job_id}
+    enc_cmd = [
+        'ffmpeg', '-y',
+        '-i', str(tmp),
+        '-vf', ','.join(vf),
+        '-c:v', *vcodec,
+        '-crf', crf,
+        '-preset', 'fast',
+        '-c:a', 'aac',
+        '-b:a', '192k',
+        '-movflags', '+faststart',
+        str(dst)
+    ]
+    proc = await asyncio.create_subprocess_exec(
+        *enc_cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    _, stderr = await proc.communicate()
+    tmp.unlink(missing_ok=True)
+    if proc.returncode != 0:
+        raise RuntimeError('Encode failed: ' + stderr.decode()[-800:])
 
 
 async def _run_export(job_id, src, clips, quality, vertical, style):
